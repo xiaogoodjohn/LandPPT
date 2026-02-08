@@ -93,18 +93,28 @@ class GeminiImageProvider(ImageGenerationProvider):
                     error_code="rate_limit_exceeded"
                 )
 
-            # 准备API请求
+            # 使用标准Gemini API的generateContent端点
+            # gemini-2.5-flash-image模型使用标准generateContent端点，但需要简化参数
             api_request = self._prepare_api_request(request)
-
-            # 调用Gemini API
-            url = f"{self.api_base}/models/{self.model}:generateContent?key={self.api_key}"
+            url = f"{self.api_base}/models/{self.model}:generateContent"
+            
+            # 确定认证方式：如果API密钥以"AQ."开头，则视为OAuth2访问令牌
+            headers = {
+                "Content-Type": "application/json"
+            }
+            
+            if self.api_key:
+                if self.api_key.startswith("AQ."):
+                    # OAuth2访问令牌，放在Authorization头中
+                    headers["Authorization"] = f"Bearer {self.api_key}"
+                else:
+                    # 普通API密钥，作为URL参数
+                    url += f"?key={self.api_key}"
 
             async with aiohttp.ClientSession() as session:
                 async with session.post(
                     url,
-                    headers={
-                        "Content-Type": "application/json"
-                    },
+                    headers=headers,
                     json=api_request,
                     timeout=aiohttp.ClientTimeout(total=180)  # 3分钟超时
                 ) as response:
@@ -139,28 +149,65 @@ class GeminiImageProvider(ImageGenerationProvider):
             )
 
     def _prepare_api_request(self, request: ImageGenerationRequest) -> Dict[str, Any]:
-        """准备API请求"""
-        # Gemini图片生成使用generateContent API
-        aspect_ratio = self._map_aspect_ratio(request.width, request.height)
-        image_size = self._map_image_size(request.width, request.height)
-        num_images = max(1, min(int(getattr(request, "num_images", 1)), 4))
+        """准备标准Gemini API请求"""
+        # 检查是否为图片生成模型
+        is_image_generation_model = ('image-generation' in self.model or
+                                   'imagen' in self.model or
+                                   'flash-image' in self.model)
+        
+        if is_image_generation_model:
+            # 对于图片生成模型，使用简化的请求格式（让模型自动处理图片生成）
+            api_request = {
+                "contents": [
+                    {
+                        "parts": [
+                            {
+                                "text": request.prompt
+                            }
+                        ]
+                    }
+                ]
+            }
+        else:
+            # 标准Gemini多模态API
+            aspect_ratio = self._map_aspect_ratio(request.width, request.height)
+            image_size = self._map_image_size(request.width, request.height)
+            num_images = max(1, min(int(getattr(request, "num_images", 1)), 4))
 
+            api_request = {
+                "contents": [
+                    {
+                        "parts": [
+                            {
+                                "text": request.prompt
+                            }
+                        ]
+                    }
+                ],
+                "generationConfig": {
+                    "responseModalities": ["IMAGE"],
+                    "aspectRatio": aspect_ratio,
+                    "imageSize": image_size,
+                    "numberOfImages": num_images,
+                    "personGeneration": "allow_adult"
+                }
+            }
+
+        return api_request
+
+    def _prepare_imagen_request(self, request: ImageGenerationRequest) -> Dict[str, Any]:
+        """准备Imagen API请求（用于图片生成）"""
+        # Imagen API使用predict端点，参数结构不同
+        num_images = max(1, min(int(getattr(request, "num_images", 1)), 4))
+        
         api_request = {
-            "contents": [
+            "instances": [
                 {
-                    "parts": [
-                        {
-                            "text": request.prompt
-                        }
-                    ]
+                    "prompt": request.prompt
                 }
             ],
-            "generationConfig": {
-                "responseModalities": ["IMAGE"],
-                "aspectRatio": aspect_ratio,
-                "imageSize": image_size,
-                "numberOfImages": num_images,
-                "personGeneration": "allow_adult"
+            "parameters": {
+                "sampleCount": num_images
             }
         }
 
@@ -171,34 +218,59 @@ class GeminiImageProvider(ImageGenerationProvider):
                                     request: ImageGenerationRequest) -> ImageOperationResult:
         """处理API响应"""
         try:
-            candidates = response_data.get('candidates', [])
-            if not candidates:
-                return ImageOperationResult(
-                    success=False,
-                    message="No candidates in response",
-                    error_code="no_data"
-                )
+            # 检查是否为Imagen API响应
+            if 'predictions' in response_data:
+                # Imagen API响应格式
+                predictions = response_data.get('predictions', [])
+                if not predictions:
+                    return ImageOperationResult(
+                        success=False,
+                        message="No predictions in response",
+                        error_code="no_data"
+                    )
+                
+                # 获取第一个预测的图片数据
+                prediction = predictions[0]
+                image_data = prediction.get('bytesBase64Encoded')
+                mime_type = prediction.get('mimeType', 'image/png')
+                
+                if not image_data:
+                    return ImageOperationResult(
+                        success=False,
+                        message="No image data in response",
+                        error_code="no_image"
+                    )
+                    
+            else:
+                # 标准Gemini API响应格式
+                candidates = response_data.get('candidates', [])
+                if not candidates:
+                    return ImageOperationResult(
+                        success=False,
+                        message="No candidates in response",
+                        error_code="no_data"
+                    )
 
-            # 查找图片数据
-            image_data = None
-            for candidate in candidates:
-                content = candidate.get('content', {})
-                parts = content.get('parts', [])
-                for part in parts:
-                    if 'inlineData' in part:
-                        inline_data = part['inlineData']
-                        if inline_data.get('mimeType', '').startswith('image/'):
-                            image_data = inline_data.get('data')
-                            break
-                if image_data:
-                    break
+                # 查找图片数据
+                image_data = None
+                for candidate in candidates:
+                    content = candidate.get('content', {})
+                    parts = content.get('parts', [])
+                    for part in parts:
+                        if 'inlineData' in part:
+                            inline_data = part['inlineData']
+                            if inline_data.get('mimeType', '').startswith('image/'):
+                                image_data = inline_data.get('data')
+                                break
+                    if image_data:
+                        break
 
-            if not image_data:
-                return ImageOperationResult(
-                    success=False,
-                    message="No image data in response",
-                    error_code="no_image"
-                )
+                if not image_data:
+                    return ImageOperationResult(
+                        success=False,
+                        message="No image data in response",
+                        error_code="no_image"
+                    )
 
             # 解码并保存图片
             image_path, image_size = await self._save_image(image_data, request)
@@ -346,28 +418,23 @@ class GeminiImageProvider(ImageGenerationProvider):
             }
 
         try:
-            # 简单的API连通性检查
-            url = f"{self.api_base}/models?key={self.api_key}"
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    url,
-                    timeout=aiohttp.ClientTimeout(total=10)
-                ) as response:
-
-                    if response.status == 200:
-                        return {
-                            'status': 'healthy',
-                            'message': 'API accessible',
-                            'provider': self.provider.value,
-                            'model': self.model,
-                            'rate_limit_remaining': self.rate_limit_requests - len(self._request_history)
-                        }
-                    else:
-                        return {
-                            'status': 'unhealthy',
-                            'message': f'API error: {response.status}',
-                            'provider': self.provider.value
-                        }
+            # 对于Gemini图片生成，我们不进行复杂的健康检查
+            # 因为OAuth2令牌的验证需要实际的API调用
+            # 这里只检查配置是否完整
+            if self.api_base and self.model:
+                return {
+                    'status': 'healthy',
+                    'message': 'Configuration valid',
+                    'provider': self.provider.value,
+                    'model': self.model,
+                    'rate_limit_remaining': self.rate_limit_requests - len(self._request_history)
+                }
+            else:
+                return {
+                    'status': 'unhealthy',
+                    'message': 'Incomplete configuration',
+                    'provider': self.provider.value
+                }
 
         except Exception as e:
             return {
